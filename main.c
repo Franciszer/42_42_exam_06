@@ -1,175 +1,238 @@
-#include <netinet/in.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <errno.h>
 #include <string.h>
-#include <sys/select.h>
-#include <sys/socket.h>
 #include <unistd.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <stdlib.h>
+#include <stdio.h>
 
-typedef struct s_client {
-	int fd;
-	int id;
-	struct s_client *next;
-} t_client;
+typedef struct  s_server {
+	/* data */
+	int		*ids; 	// client ids indexed by fd
+	int		sockfd; // server fd
+	int		max_fd;
+	int		max_id;
+	fd_set	rd;
+	fd_set	wr;
+	fd_set	fds;
+}               t_server;
 
-enum	e_err {
-	ERR_FATAL,
-	ERR_ARGS
+const char*	errs[2] = {
+		"Fatal\n",
+		"Wrong number of arguments\n"
 };
 
-t_client*	g_clients = NULL;
-int 		max_fd;
-fd_set all_set, read_set, write_set;
+void			fatal(t_server* server) {
 
-int sockfd, g_id = 0;
-char server_msg[42];
-char client_msg[4096 * 42], buffer[4096 * 42 + 42];
-
-const char *errs[2] = {
-	"Fatal error\n",
-	"Wrong number of arguments"
-};
-
-void fatal() {
-	write(2, errs[ERR_FATAL], strlen(errs[ERR_FATAL]));
-
-	t_client*	nav = g_clients;
-
-	while(nav) {
-		t_client*	tmp = nav->next;
-		free(nav);
-		nav = tmp;
+	// if server is initialized
+	if (server->sockfd > 0) {
+		for (int fd = 0 ; fd < server->max_fd + 1 ; fd++) {
+			if (server->ids[fd] != -1)
+				close(fd);
+		}
+		free(server->ids);
 	}
+
+	write(2, errs[0], strlen(errs[0]));
+
 	exit(1);
 }
 
-void send_message(const int fd, char* msg, const int len) {
-	t_client*	nav = g_clients;
-	while (nav) {
-		if (nav->fd != -1 && nav->fd != fd && FD_ISSET(nav->fd, &write_set)) {
-			send(nav->fd, msg, len, 0);
-		}
-		nav = nav->next;
-	}
-	bzero(msg, len);
+
+void		init_server(t_server* server, int sockfd) {
+	server->sockfd = sockfd;
+	server->max_fd = sockfd;
+	server->max_id = 0;
+	server->ids = malloc(sizeof(int) * (server->sockfd + 1));
+
+	if (!server->ids)
+		fatal(server);
+
+	for (int i = 0 ; i < sockfd + 1; i++)
+		server->ids[i] = -1;
+	FD_ZERO(&server->fds);
+	FD_SET(sockfd, &server->fds);
 }
 
-void add_client() {
+void		send_message(const char* msg, const int len, const int cli_fd, t_server* server) {
+
+	for (int fd = 0 ; fd < server->max_fd + 1 ; fd++) {
+		if (fd != server->sockfd && fd != cli_fd &&
+			server->ids[fd] != -1 &&
+			FD_ISSET(fd, &server->wr)) {
+			send(fd, msg, len, 0);
+		}
+	}
+}
+
+void		add_client(t_server* server) {
 	struct sockaddr_in	cli;
-	socklen_t len = sizeof(cli);
-	int new_fd = accept(sockfd, (struct sockaddr*)&cli, &len);
-	if (new_fd < 0)
-		fatal();
-	else if (new_fd > max_fd)
-		max_fd = new_fd;
-	t_client*	new = malloc(sizeof(t_client));
+	socklen_t			cli_len;
 
-	if (!new)
-		fatal();
+	bzero(&cli, sizeof(cli));
 
-	new->fd = new_fd;
-	new->id = g_id++;
+	const int	cli_fd = accept(server->sockfd, (struct sockaddr*)&cli, &cli_len);
+	if (cli_fd == -1)
+		fatal(server);
 
-	if (g_clients)
-		new->next = g_clients;
+	FD_SET(cli_fd, &server->fds);
+
+	if (cli_fd > server->max_fd) {
+		server->ids = realloc(server->ids, sizeof(int) * (cli_fd + 1));
+		if (!server->ids)
+			fatal(server);
+		for (int i = server->max_fd + 1; i < cli_fd ; i++) {
+			server->ids[i] = -1;
+		}
+		server->max_fd = cli_fd;
+	}
+
+	char	server_msg[42];
+	int len = sprintf(server_msg, "server: client %d just arrived\n", server->max_id);
+	server->ids[cli_fd] = server->max_id++;
+	send_message(server_msg, len, cli_fd, server);
+}
+
+void		del_client(int fd, t_server* server) {
+	const int	client_id = server->ids[fd];
+	char		server_msg[42];
+
+	server->ids[fd] = -1;
+	close(fd);
+	FD_CLR(fd, &server->fds);
+	int len = sprintf(server_msg, "server: client %d just left\n", client_id);
+	send_message(server_msg, len, server->sockfd, server);
+
+}
+
+char *str_join(char *buf, char *add)
+{
+	char	*newbuf;
+	int		len;
+
+	if (buf == 0)
+		len = 0;
 	else
-		new->next = NULL;
-	g_clients = new;
-
-	sprintf(server_msg, "server: client %d just arrived\n", new->id);
-	const int msg_len = strlen(server_msg);
-	send_message(new->fd, server_msg, msg_len);
-	FD_SET(new->fd, &all_set);
+		len = strlen(buf);
+	newbuf = malloc(sizeof(*newbuf) * (len + strlen(add) + 1));
+	if (newbuf == 0)
+		return (0);
+	newbuf[0] = 0;
+	if (buf != 0)
+		strcat(newbuf, buf);
+	free(buf);
+	strcat(newbuf, add);
+	return (newbuf);
 }
 
-void del_client(t_client* client) {
-	FD_CLR(client->fd, &all_set);
-	close(client->fd);
-	client->fd = -1;
-	sprintf(server_msg, "server: client %d just left\n", client->id);
-	send_message(sockfd, server_msg, strlen(server_msg));
+int extract_message(char **buf, char **msg)
+{
+	char	*newbuf;
+	int	i;
 
-}
-
-void handle_message(t_client* client) {
-	char*	begin = client_msg;
-	char*	end = client_msg;
-	while ( *begin ) {
-		const char curr = *end;
-		if (curr == '\n' || curr == '\0') {
-			*end = '\0';
-			sprintf(buffer, "client %d: %s\n", client->id, begin);
-			send_message(client->fd, buffer, strlen(buffer));
-			bzero(client_msg, end - begin);
-			if (curr == '\n')
-				++end;
-			begin = end;
+	*msg = 0;
+	if (*buf == 0)
+		return (0);
+	i = 0;
+	while ((*buf)[i])
+	{
+		if ((*buf)[i] == '\n')
+		{
+			newbuf = calloc(1, sizeof(*newbuf) * (strlen(*buf + i + 1) + 1));
+			if (newbuf == 0)
+				return (-1);
+			strcpy(newbuf, *buf + i + 1);
+			*msg = *buf;
+			(*msg)[i + 1] = 0;
+			*buf = newbuf;
+			return (1);
 		}
-		else
-			end++;
+		i++;
+	}
+	return (0);
+}
+
+void		handle_client_message(int fd, t_server* server) {
+	char	buffer[42*4096];
+	char*	cli_msg = NULL;
+
+	bzero(buffer, sizeof(buffer));
+	int		red = recv(fd, buffer, sizeof(buffer), 0);
+	if (red == -1)
+		fatal(server);
+	else if (red == 0)
+		del_client(fd, server);
+	else {
+		char*	line = NULL;
+		int		ret;
+		char* bptr = buffer;
+		int ct = 0;
+		while ((ret = extract_message(&bptr, &line))) {
+			cli_msg = malloc(sizeof(char) * 20);
+			sprintf(cli_msg, "client %d: ", server->ids[fd]);
+			cli_msg = str_join(cli_msg, line);
+			send_message(cli_msg, strlen(cli_msg), fd, server);
+			if (ct++ > 0)
+				free(line);
+			free(cli_msg);
+		}
 	}
 }
 
-void handle_request() {
-	t_client*	nav = g_clients;
-	if ( FD_ISSET(sockfd, &read_set) ) {
-		add_client();
-	}
-	while (nav) {
-		if (FD_ISSET(nav->fd, &read_set)) {
-			int ret = recv(nav->fd, client_msg, sizeof(client_msg), 0);
-
-			if (ret == -1)
-				fatal();
-			// case client leaves
-			else if (ret == 0)
-				del_client(nav);
-			// case client_message
+void		handle_clients(t_server* server) {
+	for (int fd = 0 ; fd < server->max_fd + 1; fd++) {
+		if (FD_ISSET(fd, &server->rd)) {
+			if (fd == server->sockfd)
+				add_client(server);
 			else
-				handle_message(nav);
+				handle_client_message(fd, server);
 		}
-		nav = nav->next;
+	}
+}
+
+void		run_server(t_server* server) {
+	int	n_fds;
+
+	while (1) {
+		server->rd = server->wr = server->fds;
+		n_fds = select(	server->max_fd + 1,
+						   &server->rd, &server->wr,
+						   NULL, NULL);
+		if (n_fds <= 0)
+			continue ;
+
+		handle_clients(server);
 	}
 }
 
 int main(int argc, char** argv) {
 	if (argc != 2) {
-		write(2, errs[ERR_ARGS], strlen(errs[ERR_ARGS]));
+		write(2, errs[1], strlen(errs[1]));
 		exit(1);
 	}
 
-	struct sockaddr_in servaddr;
+	int 				sockfd;
+	struct sockaddr_in 	servaddr;
+	t_server			server;
+	int					port = atoi(argv[1]);
 
-	// socket create and verification
+	server.sockfd = 0;
+
 	sockfd = socket(AF_INET, SOCK_STREAM, 0);
 	if (sockfd == -1)
-		fatal();
-	max_fd = sockfd;
-	bzero(&servaddr, sizeof(servaddr));
+		fatal(&server);
+
 	servaddr.sin_family = AF_INET;
 	servaddr.sin_addr.s_addr = htonl(2130706433); //127.0.0.1
-	const int port = atoi(argv[1]);
 	servaddr.sin_port = htons(port);
 
-	// Binding newly created socket to given IP and verification
 	if ((bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr))) != 0)
-		fatal();
+		fatal(&server);
+	if (listen(sockfd, 10) != 0)
+		fatal(&server);
 
-	if (listen(sockfd, 0) != 0)
-		fatal();
+	init_server(&server, sockfd);
 
-	bzero(server_msg, sizeof(server_msg));
-	bzero(client_msg, sizeof(client_msg));
-	bzero(buffer, sizeof(buffer));
-	FD_ZERO(&all_set);
-	FD_SET(sockfd, &all_set);
-	while (1) {
-		write_set = read_set = all_set;
-		if (select(max_fd + 1, &read_set, &write_set, NULL, NULL) <= 0) {
-			continue;
-		}
-		else {
-			handle_request();
-		}
-	}
+	run_server(&server);
 }
